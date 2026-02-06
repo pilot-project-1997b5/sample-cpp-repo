@@ -1,0 +1,157 @@
+# =============================================================================
+# Mac Self-Hosted Runner 테스트용 CI 워크플로우
+# =============================================================================
+# 
+# 🎯 목적: EC2 배포 전 Mac에서 Self-hosted Runner 동작 테스트
+# 
+# ⚠️ 주의: Mac에서는 Docker container 실행이 Linux와 다름
+#    - Docker Desktop 필요
+#    - Linux container는 VM 위에서 실행됨
+# =============================================================================
+
+name: CI (Mac Self-Hosted Test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      use-container:
+        description: 'Run in Docker container (requires Docker Desktop)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  # ===========================================================================
+  # Job 1: Mac Runner에서 직접 빌드 (Container 없이)
+  # ===========================================================================
+  build-on-mac:
+    if: ${{ github.event.inputs.use-container != 'true' }}
+    runs-on: [self-hosted, macOS]
+    
+    steps:
+      # 🧹 Pre-Cleanup
+      - name: 🧹 Pre-Cleanup Workspace
+        run: |
+          echo "=========================================="
+          echo "🧹 Cleaning workspace BEFORE build..."
+          echo "=========================================="
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.[!.]* 2>/dev/null || true
+          echo "✅ Pre-cleanup completed"
+
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        
+      - name: 🔍 Check Mac build environment
+        run: |
+          echo "=========================================="
+          echo "🔍 Mac Build Environment Info"
+          echo "=========================================="
+          echo "🖥️ macOS Version:"
+          sw_vers
+          echo ""
+          echo "🔧 Available Compilers:"
+          which gcc && gcc --version 2>/dev/null || echo "GCC not found"
+          which clang && clang --version 2>/dev/null || echo "Clang not found"
+          echo ""
+          echo "📦 Build Tools:"
+          which cmake && cmake --version 2>/dev/null || echo "CMake not found (install: brew install cmake)"
+          which ninja && ninja --version 2>/dev/null || echo "Ninja not found (install: brew install ninja)"
+          echo ""
+          echo "🐳 Docker:"
+          which docker && docker --version 2>/dev/null || echo "Docker not installed"
+
+      - name: 📦 Install dependencies (if needed)
+        run: |
+          # Homebrew로 필요한 도구 설치
+          if ! command -v cmake &> /dev/null; then
+            echo "Installing CMake..."
+            brew install cmake
+          fi
+          if ! command -v ninja &> /dev/null; then
+            echo "Installing Ninja..."
+            brew install ninja
+          fi
+
+      - name: 🔨 Configure CMake
+        working-directory: src
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          
+      - name: 🏗️ Build
+        working-directory: src
+        run: |
+          cmake --build build --config Release
+          
+      - name: 📋 List build outputs
+        working-directory: src
+        run: |
+          echo "Build outputs:"
+          find build -type f -perm +111 -o -name "*.a" -o -name "*.dylib" 2>/dev/null || true
+
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-build-mac
+          path: src/build/
+          retention-days: 7
+
+      # 🧹 Post-Cleanup
+      - name: 🧹 Post-Cleanup Workspace
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "🧹 Cleaning workspace AFTER build..."
+          echo "=========================================="
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.[!.]* 2>/dev/null || true
+          echo "✅ Post-cleanup completed"
+
+  # ===========================================================================
+  # Job 2: Mac + Docker Container 빌드
+  # ===========================================================================
+  build-in-container-mac:
+    if: ${{ github.event.inputs.use-container == 'true' }}
+    runs-on: [self-hosted, macOS]
+    
+    # ⚠️ Mac에서 container 사용 시 주의사항:
+    # - Docker Desktop이 실행 중이어야 함
+    # - Linux container는 내부 VM에서 실행됨
+    container:
+      image: gcc:12
+      
+    steps:
+      - name: 🧹 Pre-Cleanup
+        run: rm -rf /github/workspace/* 2>/dev/null || true
+
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        
+      - name: 🔍 Check container environment
+        run: |
+          echo "Container: gcc:12"
+          cat /etc/os-release | head -3
+          gcc --version
+
+      - name: 📦 Install CMake
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq cmake ninja-build
+
+      - name: 🔨 Build
+        working-directory: src
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-build-container-mac
+          path: src/build/
+          retention-days: 7
+
+      - name: 🧹 Post-Cleanup
+        if: always()
+        run: rm -rf /github/workspace/* 2>/dev/null || true
