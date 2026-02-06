@@ -1,0 +1,43 @@
+name: CI (EC2 Self-Hosted)
+
+on:
+  workflow_dispatch:
+  # push/pull_request can be enabled if needed, but dispatch is safer for self-hosted test
+
+jobs:
+  # Dispatcher Job: Check resources/conditions to select the best runner
+  check-resources:
+    runs-on: ubuntu-latest
+    outputs:
+      selected-runner: ${{ steps.decide.outputs.runner }}
+    steps:
+      - id: decide
+        name: Check Availability and Select Runner
+        run: |
+          echo "Checking runner availability..."
+          # Mock Logic: In real world, query monitoring system / load balancer API
+          # Demo: use 'ec2' by default, or could be conditional
+          echo "runner=ec2" >> $GITHUB_OUTPUT
+          echo "Selected Runner Type: ec2"
+
+  build:
+    needs: check-resources
+    uses: pilot-project-1997b5/yanmar-workflow/.github/workflows/compile-cpp-ec2.yml@main
+    with:
+      compiler: gcc
+      build-type: Release
+      cmake-args: "-DENABLE_TESTS=OFF"
+      working-directory: src
+      output-path: build
+      # Dynamically assigned based on check-resources result
+      runner-target: ${{ needs.check-resources.outputs.selected-runner }}
+  
+  upload:
+    needs: build
+    uses: pilot-project-1997b5/yanmar-workflow/.github/workflows/upload-artifact-ec2.yml@main
+    with:
+      artifact-name: cpp-build-output-ec2
+      artifact-path: src/build/bin/
+      retention-days: 30
+      # Upload job can be fixed to ubuntu or also dynamic
+      runner-target: 'ubuntu'
