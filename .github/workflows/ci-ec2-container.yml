@@ -1,0 +1,228 @@
+# =============================================================================
+# EC2 Self-Hosted Runner + Container 기반 CI 워크플로우
+# =============================================================================
+#
+# 🎯 이 워크플로우가 보여주는 핵심 개념:
+#
+# 1️⃣ Workspace Cleanup (워크스페이스 정리)
+#    - Kubernetes: emptyDir 볼륨으로 Pod 종료 시 자동 삭제
+#    - EC2: Runner가 지속되므로 수동으로 cleanup 필요!
+#
+# 2️⃣ Container 기반 실행
+#    - EC2 Runner 위에서 특정 Docker 컨테이너 내부에서 빌드 실행
+#    - 빌드 환경의 일관성 보장 (특정 버전의 컴파일러, 라이브러리 등)
+#
+# =============================================================================
+
+name: CI (EC2 + Container)
+
+on:
+  workflow_dispatch:
+    inputs:
+      container-image:
+        description: 'Docker image for build (e.g., gcc:12, ubuntu:22.04)'
+        required: false
+        default: 'gcc:12'
+      cleanup-before:
+        description: 'Cleanup workspace before build'
+        required: false
+        default: 'true'
+      cleanup-after:
+        description: 'Cleanup workspace after build'
+        required: false
+        default: 'true'
+
+jobs:
+  # ===========================================================================
+  # Job 1: EC2 Self-Hosted Runner에서 Container 기반 빌드
+  # ===========================================================================
+  build-in-container:
+    runs-on: [self-hosted, aws-ec2]
+    
+    # -------------------------------------------------------------------------
+    # 🐳 Container 설정
+    # -------------------------------------------------------------------------
+    # EC2 Runner 위에서 지정된 Docker 컨테이너 내부에서 모든 steps 실행
+    # - Docker가 EC2에 설치되어 있어야 함
+    # - 컨테이너는 각 job 시작 시 생성되고 종료 시 삭제됨
+    # - 볼륨 마운트: 워크스페이스($GITHUB_WORKSPACE)가 컨테이너에 마운트됨
+    # -------------------------------------------------------------------------
+    container:
+      image: ${{ github.event.inputs.container-image || 'gcc:12' }}
+      # 옵션: 환경변수, 볼륨, 네트워크 등 설정 가능
+      # options: --user root
+      # volumes:
+      #   - /cache:/cache
+      # env:
+      #   CC: gcc-12
+    
+    steps:
+      # -----------------------------------------------------------------------
+      # 🧹 Step 1: Pre-Cleanup (빌드 전 워크스페이스 정리)
+      # -----------------------------------------------------------------------
+      # ⚠️ 왜 필요한가?
+      # - EC2 Runner는 Kubernetes와 달리 지속적으로 실행됨
+      # - 이전 빌드의 파일이 남아있을 수 있음 (캐시 충돌, 빌드 오류 유발)
+      # - 특히 동일 Runner에서 여러 프로젝트 빌드 시 중요
+      # -----------------------------------------------------------------------
+      - name: 🧹 Pre-Cleanup Workspace
+        if: ${{ github.event.inputs.cleanup-before != 'false' }}
+        run: |
+          echo "=========================================="
+          echo "🧹 Cleaning workspace BEFORE build..."
+          echo "=========================================="
+          echo "Current directory: $(pwd)"
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          
+          # 방법 1: 전체 삭제 (권장)
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.[!.]* 2>/dev/null || true
+          
+          # 방법 2: 특정 디렉토리만 삭제
+          # rm -rf build/ out/ node_modules/ .cache/ 2>/dev/null || true
+          
+          echo "✅ Pre-cleanup completed"
+          ls -la "$GITHUB_WORKSPACE" || echo "Workspace is empty"
+
+      # -----------------------------------------------------------------------
+      # 📥 Step 2: Checkout
+      # -----------------------------------------------------------------------
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: true  # checkout 전에 git clean 실행
+          
+      # -----------------------------------------------------------------------
+      # 🔍 Step 3: 환경 정보 확인
+      # -----------------------------------------------------------------------
+      - name: 🔍 Check build environment
+        run: |
+          echo "=========================================="
+          echo "🔍 Build Environment Info"
+          echo "=========================================="
+          echo "Container Image: ${{ github.event.inputs.container-image || 'gcc:12' }}"
+          echo ""
+          echo "📋 System Info:"
+          cat /etc/os-release 2>/dev/null | head -5 || echo "Unknown OS"
+          echo ""
+          echo "🔧 Compiler Info:"
+          gcc --version 2>/dev/null || echo "GCC not found"
+          g++ --version 2>/dev/null || echo "G++ not found"
+          cmake --version 2>/dev/null || echo "CMake not found"
+          echo ""
+          echo "📁 Workspace Contents:"
+          ls -la
+
+      # -----------------------------------------------------------------------
+      # 🔨 Step 4: 의존성 설치 및 빌드
+      # -----------------------------------------------------------------------
+      - name: 📦 Install dependencies
+        run: |
+          echo "Installing build dependencies..."
+          apt-get update -qq
+          apt-get install -y -qq cmake ninja-build
+          
+      - name: 🔨 Configure CMake
+        working-directory: src
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          
+      - name: 🏗️ Build
+        working-directory: src
+        run: |
+          cmake --build build --config Release
+          
+      - name: 📋 List build outputs
+        working-directory: src
+        run: |
+          echo "Build outputs:"
+          find build -type f -executable -o -name "*.a" -o -name "*.so" 2>/dev/null || true
+
+      # -----------------------------------------------------------------------
+      # 📤 Step 5: Artifacts 업로드
+      # -----------------------------------------------------------------------
+      - name: 📤 Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-build-ec2-container
+          path: src/build/
+          retention-days: 7
+
+      # -----------------------------------------------------------------------
+      # 🧹 Step 6: Post-Cleanup (빌드 후 워크스페이스 정리)
+      # -----------------------------------------------------------------------
+      # ⚠️ 왜 필요한가?
+      # - 다음 빌드를 위해 깨끗한 상태 유지
+      # - 디스크 공간 확보 (특히 빌드 결과물이 큰 경우)
+      # - 보안: 민감한 정보(credentials, secrets)가 남지 않도록
+      # -----------------------------------------------------------------------
+      - name: 🧹 Post-Cleanup Workspace
+        if: always() && github.event.inputs.cleanup-after != 'false'
+        run: |
+          echo "=========================================="
+          echo "🧹 Cleaning workspace AFTER build..."
+          echo "=========================================="
+          
+          # 빌드 결과물 삭제
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.[!.]* 2>/dev/null || true
+          
+          # Docker 관련 정리 (필요시)
+          # docker system prune -f 2>/dev/null || true
+          
+          echo "✅ Post-cleanup completed"
+
+  # ===========================================================================
+  # Job 2: Container 없이 EC2 Runner에서 직접 실행 (비교용)
+  # ===========================================================================
+  build-on-host:
+    runs-on: [self-hosted, aws-ec2]
+    needs: build-in-container
+    if: false  # 기본적으로 비활성화 (데모용)
+    
+    steps:
+      - name: 🧹 Pre-Cleanup
+        run: rm -rf * .[!.]* 2>/dev/null || true
+        
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        
+      - name: 🔨 Build (Host에서 직접)
+        working-directory: src
+        run: |
+          # EC2 호스트에 설치된 도구 사용
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          
+      - name: 🧹 Post-Cleanup
+        if: always()
+        run: rm -rf * .[!.]* 2>/dev/null || true
+
+  # ===========================================================================
+  # Job 3: 여러 컨테이너에서 Matrix 빌드
+  # ===========================================================================
+  matrix-container-build:
+    runs-on: [self-hosted, aws-ec2]
+    needs: build-in-container
+    if: false  # 기본적으로 비활성화 (데모용)
+    
+    strategy:
+      matrix:
+        container: ['gcc:11', 'gcc:12', 'gcc:13']
+        
+    container:
+      image: ${{ matrix.container }}
+      
+    steps:
+      - name: 🧹 Pre-Cleanup
+        run: rm -rf /github/workspace/* 2>/dev/null || true
+        
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        
+      - name: 🔨 Build in ${{ matrix.container }}
+        run: |
+          apt-get update -qq && apt-get install -y -qq cmake
+          cd src && cmake -B build && cmake --build build
+          
+      - name: 🧹 Post-Cleanup
+        if: always()
+        run: rm -rf /github/workspace/* 2>/dev/null || true
